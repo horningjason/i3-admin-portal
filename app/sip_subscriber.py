@@ -103,6 +103,8 @@ class PersistentSipSubscriber:
         self._probe_task: asyncio.Task | None = None
         self._options_call_id = f"portal-opt-{uuid.uuid4().hex[:12]}"
         self._options_cseq = 0
+        self._options_since_ack = 0  # OPTIONS pings sent with no ack — flags an FE that ignores OPTIONS
+        self._options_warned = False
         self._local_ip = _local_ip_for(node.sip_host, node.sip_port)
         self.is_active = False
         self._last_heard_mono: float | None = None  # monotonic time of last proof-of-life
@@ -194,6 +196,15 @@ class PersistentSipSubscriber:
             f"Content-Length: 0\r\n\r\n"
         )
         self._transport.sendto(msg.encode(), (host, port))
+        self._options_since_ack += 1
+        log.debug("OPTIONS ping -> %s (%s:%s) cseq=%s", self._node.name, host, port, self._options_cseq)
+        if self._options_since_ack >= STALE_MULTIPLIER and not self._options_warned:
+            self._options_warned = True
+            log.warning(
+                "%s has not answered %d OPTIONS watchdog pings — this FE likely doesn't "
+                "respond to SIP OPTIONS, so liveness will fall back to NOTIFY/LogEvent traffic only.",
+                self._node.name, self._options_since_ack,
+            )
 
     def _add(self, kind: str, summary: str, detail: dict) -> None:
         self._store.add(kind, summary, detail, source=self._node.name, role=self._node.role)
@@ -236,7 +247,12 @@ class PersistentSipSubscriber:
 
         if first_line.startswith("SIP/2.0"):
             if "OPTIONS" in _header(lines, "CSeq").upper():
-                return  # watchdog ping ack — liveness already updated above, don't log noise
+                # watchdog ping ack — liveness already updated above, don't log noise
+                if self._options_warned:
+                    log.info("%s is now answering OPTIONS watchdog pings again", self._node.name)
+                self._options_since_ack = 0
+                self._options_warned = False
+                return
             min_expires = _header(lines, "Min-Expires")
             self._add(
                 "sip_subscribe",
