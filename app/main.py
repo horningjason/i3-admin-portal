@@ -71,6 +71,14 @@ _LOG_EVENT_KIND = {
     "VersionsLogEvent": "log_other",
 }
 
+# A LogEvent for one of these types is proof the node is actively dispatching
+# the corresponding SIP event package right now — a stronger, immediate
+# signal than waiting for the next scheduled initial-subscribe retry tick.
+_LOG_EVENT_TO_PACKAGE = {
+    "ElementStateChangeLogEvent": "emergency-ElementState",
+    "ServiceStateChangeLogEvent": "emergency-ServiceState",
+}
+
 # §3.7.1 DiscrepancyReport MANDATORY prolog fields (i3-fe-core
 # discrepancy/models.py DiscrepancyReport._require call in from_dict).
 _DR_REQUIRED_FIELDS = (
@@ -187,6 +195,9 @@ async def receive_log_event(request: Request):
     sub = subscribers.get(source)
     if sub:
         sub.note_alive()
+        package = _LOG_EVENT_TO_PACKAGE.get(body.get("logEventType"))
+        if package:
+            sub.kick_initial_subscribe(package)
     store.add(kind, summary, body, source=source, role=role)
     return JSONResponse({"status": "accepted"}, status_code=201)
 

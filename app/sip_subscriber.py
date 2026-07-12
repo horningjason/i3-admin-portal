@@ -54,6 +54,16 @@ PACKAGES = ("emergency-ElementState", "emergency-ServiceState")
 WATCHDOG_INTERVAL_SECONDS = 15
 STALE_MULTIPLIER = 3  # tolerate a couple missed heartbeats before calling it unreachable
 
+# The initial SUBSCRIBE after start() races container boot: if it's sent
+# before the target node's SipWireAdapter has bound its socket, the datagram
+# is silently dropped (UDP, no retransmit) and the normal refresh cadence
+# wouldn't retry for up to SUBSCRIBE_EXPIRES - REFRESH_MARGIN seconds. So the
+# initial SUBSCRIBE gets its own short-lived, backing-off retry loop, capped
+# at INITIAL_SUBSCRIBE_RETRY_CAP seconds total, independent of _refresh_loop.
+INITIAL_SUBSCRIBE_RETRY_START = 1.0
+INITIAL_SUBSCRIBE_RETRY_MAX = 15.0
+INITIAL_SUBSCRIBE_RETRY_CAP = 60.0
+
 
 class _Protocol(asyncio.DatagramProtocol):
     def __init__(self, on_datagram):
@@ -100,6 +110,8 @@ class PersistentSipSubscriber:
         self._call_ids: dict[str, str] = {}
         self._cseq: dict[str, int] = {p: 0 for p in PACKAGES}
         self._refresh_tasks: dict[str, asyncio.Task] = {}
+        self._initial_retry_tasks: dict[str, asyncio.Task] = {}
+        self._initial_confirmed: dict[str, bool] = {p: False for p in PACKAGES}
         self._probe_task: asyncio.Task | None = None
         self._options_call_id = f"portal-opt-{uuid.uuid4().hex[:12]}"
         self._options_cseq = 0
@@ -132,6 +144,14 @@ class PersistentSipSubscriber:
         """
         self._last_heard_mono = time.monotonic()
 
+    def kick_initial_subscribe(self, package: str) -> None:
+        """If the initial SUBSCRIBE for `package` hasn't been confirmed yet,
+        immediately resend it now rather than waiting for the next scheduled
+        retry tick. Safe to call redundantly — a confirmed package is a no-op,
+        and an extra SUBSCRIBE while unconfirmed is harmless/idempotent."""
+        if not self._initial_confirmed.get(package, True):
+            self._subscribe(package, SUBSCRIBE_EXPIRES)
+
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
@@ -144,6 +164,9 @@ class PersistentSipSubscriber:
             self._call_ids[package] = f"portal-{uuid.uuid4().hex[:12]}"
             self._subscribe(package, SUBSCRIBE_EXPIRES)
             self._refresh_tasks[package] = asyncio.create_task(self._refresh_loop(package))
+            self._initial_retry_tasks[package] = asyncio.create_task(
+                self._initial_subscribe_retry_loop(package)
+            )
         self._probe_task = asyncio.create_task(self._probe_loop())
 
     async def stop(self) -> None:
@@ -151,6 +174,8 @@ class PersistentSipSubscriber:
         if self._probe_task:
             self._probe_task.cancel()
         for task in self._refresh_tasks.values():
+            task.cancel()
+        for task in self._initial_retry_tasks.values():
             task.cancel()
         for package in PACKAGES:
             self._subscribe(package, 0)
@@ -163,6 +188,34 @@ class PersistentSipSubscriber:
             while True:
                 await asyncio.sleep(SUBSCRIBE_EXPIRES - REFRESH_MARGIN)
                 self._subscribe(package, SUBSCRIBE_EXPIRES)
+        except asyncio.CancelledError:
+            pass
+
+    async def _initial_subscribe_retry_loop(self, package: str) -> None:
+        """Resend the initial SUBSCRIBE for `package` at an increasing
+        interval (1s, 2s, 4s, 8s, capped at 15s) until a 200 OK matching its
+        Call-ID is observed in _on_datagram, or INITIAL_SUBSCRIBE_RETRY_CAP
+        seconds have elapsed. Covers the boot race where the first SUBSCRIBE
+        is sent before the target's SIP listener is bound and is silently
+        dropped over UDP. Runs only for the initial SUBSCRIBE — once
+        confirmed, or once the cap is hit, _refresh_loop's normal cadence is
+        the sole retry mechanism."""
+        delay = INITIAL_SUBSCRIBE_RETRY_START
+        elapsed = 0.0
+        try:
+            while elapsed < INITIAL_SUBSCRIBE_RETRY_CAP:
+                await asyncio.sleep(delay)
+                elapsed += delay
+                if self._initial_confirmed[package]:
+                    return
+                self._subscribe(package, SUBSCRIBE_EXPIRES)
+                delay = min(delay * 2, INITIAL_SUBSCRIBE_RETRY_MAX)
+            if not self._initial_confirmed[package]:
+                log.warning(
+                    "%s: no confirmed SUBSCRIBE response for %s after ~%.0fs of "
+                    "initial retries — falling back to the standard %ds refresh cycle",
+                    self._node.name, package, elapsed, SUBSCRIBE_EXPIRES,
+                )
         except asyncio.CancelledError:
             pass
 
@@ -279,6 +332,12 @@ class PersistentSipSubscriber:
                 self._options_warned = False
                 return
             min_expires = _header(lines, "Min-Expires")
+            if "200" in first_line:
+                resp_call_id = _header(lines, "Call-ID").split(":", 1)[-1].strip()
+                for package, call_id in self._call_ids.items():
+                    if call_id == resp_call_id:
+                        self._initial_confirmed[package] = True
+                        break
             self._add(
                 "sip_subscribe",
                 f"response: {first_line}" + (f" ({min_expires})" if min_expires else ""),
