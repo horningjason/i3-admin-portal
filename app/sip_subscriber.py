@@ -120,6 +120,7 @@ class PersistentSipSubscriber:
         self._local_ip = _local_ip_for(node.sip_host, node.sip_port)
         self.is_active = False
         self._last_heard_mono: float | None = None  # monotonic time of last proof-of-life
+        self._resolved_ip: str | None = None
 
     @property
     def status(self) -> str:
@@ -144,13 +145,35 @@ class PersistentSipSubscriber:
         """
         self._last_heard_mono = time.monotonic()
 
-    def kick_initial_subscribe(self, package: str) -> None:
+    async def kick_initial_subscribe(self, package: str) -> None:
         """If the initial SUBSCRIBE for `package` hasn't been confirmed yet,
         immediately resend it now rather than waiting for the next scheduled
         retry tick. Safe to call redundantly — a confirmed package is a no-op,
         and an extra SUBSCRIBE while unconfirmed is harmless/idempotent."""
         if not self._initial_confirmed.get(package, True):
-            self._subscribe(package, SUBSCRIBE_EXPIRES)
+            await self._subscribe(package, SUBSCRIBE_EXPIRES)
+
+    async def _resolve_host(self) -> str | None:
+        """Resolve self._node.sip_host to an IP once and cache it. Returns
+        None (and leaves the cache unset) if resolution fails, so callers can
+        skip this send attempt and let the existing retry/probe loops try
+        again on their normal schedule rather than raising."""
+        if self._resolved_ip is not None:
+            return self._resolved_ip
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(
+                self._node.sip_host, self._node.sip_port,
+                type=socket.SOCK_DGRAM,
+            )
+        except OSError:
+            log.debug("%s: DNS resolution for %r failed, will retry",
+                      self._node.name, self._node.sip_host)
+            return None
+        if not infos:
+            return None
+        self._resolved_ip = infos[0][4][0]
+        return self._resolved_ip
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -162,7 +185,7 @@ class PersistentSipSubscriber:
         self.is_active = True
         for package in PACKAGES:
             self._call_ids[package] = f"portal-{uuid.uuid4().hex[:12]}"
-            self._subscribe(package, SUBSCRIBE_EXPIRES)
+            await self._subscribe(package, SUBSCRIBE_EXPIRES)
             self._refresh_tasks[package] = asyncio.create_task(self._refresh_loop(package))
             self._initial_retry_tasks[package] = asyncio.create_task(
                 self._initial_subscribe_retry_loop(package)
@@ -178,7 +201,7 @@ class PersistentSipSubscriber:
         for task in self._initial_retry_tasks.values():
             task.cancel()
         for package in PACKAGES:
-            self._subscribe(package, 0)
+            await self._subscribe(package, 0)
         await asyncio.sleep(0.2)
         if self._transport:
             self._transport.close()
@@ -187,7 +210,7 @@ class PersistentSipSubscriber:
         try:
             while True:
                 await asyncio.sleep(SUBSCRIBE_EXPIRES - REFRESH_MARGIN)
-                self._subscribe(package, SUBSCRIBE_EXPIRES)
+                await self._subscribe(package, SUBSCRIBE_EXPIRES)
         except asyncio.CancelledError:
             pass
 
@@ -208,7 +231,7 @@ class PersistentSipSubscriber:
                 elapsed += delay
                 if self._initial_confirmed[package]:
                     return
-                self._subscribe(package, SUBSCRIBE_EXPIRES)
+                await self._subscribe(package, SUBSCRIBE_EXPIRES)
                 delay = min(delay * 2, INITIAL_SUBSCRIBE_RETRY_MAX)
             if not self._initial_confirmed[package]:
                 log.warning(
@@ -225,13 +248,17 @@ class PersistentSipSubscriber:
         SUBSCRIBE refresh. Probe immediately, then on the interval."""
         try:
             while True:
-                self._send_options()
+                await self._send_options()
                 await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             pass
 
-    def _send_options(self) -> None:
+    async def _send_options(self) -> None:
         if not self._transport:
+            return
+        resolved_ip = await self._resolve_host()
+        if resolved_ip is None:
+            log.debug("%s: skipping OPTIONS ping, host not yet resolved", self._node.name)
             return
         host, port = self._node.sip_host, self._node.sip_port
         self._options_cseq += 1
@@ -248,7 +275,7 @@ class PersistentSipSubscriber:
             f"Max-Forwards: 70\r\n"
             f"Content-Length: 0\r\n\r\n"
         )
-        self._transport.sendto(msg.encode(), (host, port))
+        self._transport.sendto(msg.encode(), (resolved_ip, port))
         self._options_since_ack += 1
         log.debug("OPTIONS ping -> %s (%s:%s) cseq=%s", self._node.name, host, port, self._options_cseq)
         if self._options_since_ack >= STALE_MULTIPLIER and not self._options_warned:
@@ -262,8 +289,12 @@ class PersistentSipSubscriber:
     def _add(self, kind: str, summary: str, detail: dict) -> None:
         self._store.add(kind, summary, detail, source=self._node.name, role=self._node.role)
 
-    def _subscribe(self, package: str, expires: int) -> None:
+    async def _subscribe(self, package: str, expires: int) -> None:
         if not self._transport:
+            return
+        resolved_ip = await self._resolve_host()
+        if resolved_ip is None:
+            log.debug("%s: skipping SUBSCRIBE for %s, host not yet resolved", self._node.name, package)
             return
         host, port = self._node.sip_host, self._node.sip_port
         self._cseq[package] += 1
@@ -308,7 +339,7 @@ class PersistentSipSubscriber:
             f"Content-Length: {len(body.encode())}\r\n\r\n"
             f"{body}"
         )
-        self._transport.sendto(msg.encode(), (host, port))
+        self._transport.sendto(msg.encode(), (resolved_ip, port))
         action = "unsubscribe" if expires == 0 else ("refresh" if self._cseq[package] > 1 else "subscribe")
         self._add(
             "sip_subscribe",

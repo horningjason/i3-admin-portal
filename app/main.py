@@ -197,7 +197,7 @@ async def receive_log_event(request: Request):
         sub.note_alive()
         package = _LOG_EVENT_TO_PACKAGE.get(body.get("logEventType"))
         if package:
-            sub.kick_initial_subscribe(package)
+            await sub.kick_initial_subscribe(package)
     store.add(kind, summary, body, source=source, role=role)
     return JSONResponse({"status": "accepted"}, status_code=201)
 
