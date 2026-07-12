@@ -338,14 +338,16 @@ async function loadNodes() {
     let live = 0;
     for (const n of nodeList) {
       ensureSourceChip(n.name);
-      if (n.sip_confirmed) live += 1;
+      if (n.sip_status === "live") live += 1;
       const chip = document.createElement("div");
       chip.className = "node-chip";
       const dotColor = !n.has_sip ? "var(--text-muted)"
-                      : n.sip_confirmed ? "var(--status-good)"
+                      : n.sip_status === "live" ? "var(--status-good)"
+                      : n.sip_status === "unreachable" ? "var(--status-critical)"
                       : "var(--status-warning)";
+      const statusLabel = !n.has_sip ? "" : n.sip_status === "unreachable" ? " (unreachable)" : "";
       chip.innerHTML = `<span class="conn-dot" style="background:${dotColor};margin-right:0"></span>
-                         <span class="role-tag">${escapeHtml(n.role)}</span> ${escapeHtml(n.name)}`;
+                         <span class="role-tag">${escapeHtml(n.role)}</span> ${escapeHtml(n.name)}${statusLabel}`;
       nodesEl.appendChild(chip);
     }
     statNodes.textContent = `${live}/${nodeList.filter(n => n.has_sip).length}`;

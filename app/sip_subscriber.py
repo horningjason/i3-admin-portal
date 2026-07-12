@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import socket
+import time
 import uuid
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,16 @@ log = logging.getLogger("i3_admin_portal.sip")
 SUBSCRIBE_EXPIRES = 300
 REFRESH_MARGIN = 30
 PACKAGES = ("emergency-ElementState", "emergency-ServiceState")
+
+# §2.4.1/§2.4.2: "Filter requests MAY specify a minimum notification
+# interval... This can be used as a watchdog mechanism." An admin/ops
+# dashboard is exactly the subscriber that *should* opt into that watchdog —
+# we request it explicitly so a node going dark is detected in roughly
+# WATCHDOG_INTERVAL * STALE_MULTIPLIER seconds instead of waiting up to the
+# full 270s SUBSCRIBE refresh cycle (and even then, only a live SIP node can
+# ever tell us about itself going away — an outright killed container can't).
+WATCHDOG_INTERVAL_SECONDS = 30
+STALE_MULTIPLIER = 3  # tolerate a couple missed heartbeats before calling it unreachable
 
 
 class _Protocol(asyncio.DatagramProtocol):
@@ -79,7 +90,19 @@ class PersistentSipSubscriber:
         self._refresh_tasks: dict[str, asyncio.Task] = {}
         self._local_ip = _local_ip_for(node.sip_host, node.sip_port)
         self.is_active = False
-        self.confirmed = False  # True once we've seen any reply from the node
+        self._last_heard_mono: float | None = None  # monotonic time of last datagram received
+
+    @property
+    def status(self) -> str:
+        """'pending' — never heard from; 'live' — heard from recently
+        (within the watchdog window); 'unreachable' — was heard from once
+        but has gone quiet longer than the watchdog tolerates."""
+        if self._last_heard_mono is None:
+            return "pending"
+        stale_after = WATCHDOG_INTERVAL_SECONDS * STALE_MULTIPLIER
+        if time.monotonic() - self._last_heard_mono <= stale_after:
+            return "live"
+        return "unreachable"
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -131,7 +154,7 @@ class PersistentSipSubscriber:
             f"Call-ID: {call_id}\r\n"
             f"CSeq: {self._cseq[package]} SUBSCRIBE\r\n"
             f"Contact: <sip:i3-admin-portal@{self._local_ip}:{self._local_port}>\r\n"
-            f"Event: {package}\r\n"
+            f"Event: {package};min-interval={WATCHDOG_INTERVAL_SECONDS}\r\n"
             f"Max-Forwards: 70\r\n"
             f"Expires: {expires}\r\n"
             f"Content-Length: 0\r\n\r\n"
@@ -149,7 +172,7 @@ class PersistentSipSubscriber:
         head, _, body = text.partition("\r\n\r\n")
         lines = head.split("\r\n")
         first_line = lines[0]
-        self.confirmed = True
+        self._last_heard_mono = time.monotonic()
 
         if first_line.startswith("SIP/2.0"):
             min_expires = _header(lines, "Min-Expires")

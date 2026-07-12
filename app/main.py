@@ -129,7 +129,7 @@ async def api_nodes():
                 "role": n.role,
                 "has_sip": n.has_sip,
                 "sip_active": bool(subscribers.get(n.name) and subscribers[n.name].is_active),
-                "sip_confirmed": bool(subscribers.get(n.name) and subscribers[n.name].confirmed),
+                "sip_status": subscribers[n.name].status if n.name in subscribers else "pending",
             }
             for n in nodes
         ]
