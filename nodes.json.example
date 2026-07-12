@@ -1,0 +1,9 @@
+[
+  { "name": "lvf-child",  "role": "LVF",  "sip_host": "192.168.1.10", "sip_port": 5060, "element_id": "lvf-child.nd911.nd.gov" },
+  { "name": "lvf-parent", "role": "LVF",  "sip_host": "192.168.1.11", "sip_port": 5060, "element_id": "lvf-parent.nd911.nd.gov" },
+  { "name": "lvf-fg",     "role": "LVF",  "sip_host": "192.168.1.12", "sip_port": 5060, "element_id": "lvf-fg.nd911.nd.gov" },
+  { "name": "ecrf-1",     "role": "ECRF", "sip_host": "192.168.1.20", "sip_port": 5060 },
+  { "name": "mcs-1",      "role": "MCS",  "sip_host": "192.168.1.30", "sip_port": 5060 },
+  { "name": "gcs-1",      "role": "GCS",  "sip_host": "192.168.1.40", "sip_port": 5060 },
+  { "name": "mds-1",      "role": "MDS",  "sip_host": "192.168.1.50", "sip_port": 5060 }
+]

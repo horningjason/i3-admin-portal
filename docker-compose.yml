@@ -1,0 +1,18 @@
+services:
+  i3-admin-portal:
+    build: .
+    ports:
+      - "9100:9100"
+    volumes:
+      # nodes.json is environment-specific (real host/port/element_id per
+      # node) — mount it in rather than baking it into the image. Copy
+      # nodes.json.example to nodes.json alongside this file and edit it.
+      - ./nodes.json:/app/nodes.json:ro
+    env_file:
+      - .env
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
