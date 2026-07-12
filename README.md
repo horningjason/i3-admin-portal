@@ -14,10 +14,15 @@ the two wire protocols those repos already expose:
    configured node** — stays SUBSCRIBEd to each node's
    `emergency-ElementState` and `emergency-ServiceState` event packages over
    raw UDP, refreshing before expiry, and shows every NOTIFY live.
+3. **Discrepancy Reporting receiver** (§3.7.1) — accepts `POST {uri}/Reports`,
+   matching `i3-fe-core`'s `DiscrepancyReporting.submit()` client, and
+   acknowledges with a `201 DiscrepancyReportResponse`. Passive receiver
+   only: accept, log, acknowledge — no resolution workflow.
 
-Both feeds land on one page (`/`) via Server-Sent Events, split into a
-LogEvents panel and a SIP panel, with a node status strip, click-to-expand
-raw JSON, and toggle chips to filter by event kind and by source node.
+All three feeds land on one page (`/`) via Server-Sent Events: a LogEvents
+panel and a SIP panel side by side, with a full-width Discrepancy Reports
+panel beneath them, a node status strip, click-to-expand raw JSON, and
+toggle chips to filter by event kind and by source node.
 
 ## Run
 
@@ -67,6 +72,22 @@ Posts unsigned JSON today (no JWS signer configured on any node yet — see
 LVF's `CLAUDE.md`, `requiredAlgorithms: []`), which this receiver accepts
 as-is.
 
+## Point a node's DR endpoint at it
+
+`i3-fe-core`'s `DiscrepancyReporting.submit()` POSTs to `{base_uri}/Reports`,
+so point a node's DR endpoint at this portal's base URL the same way as
+`LVF_LOGGING_SERVICE_URI` — no `/Reports` suffix, the FE appends it:
+
+```
+LVF_DR_ENDPOINT=http://localhost:9100
+```
+
+The portal accepts the DR, logs it (attributed by `reportingAgencyName`
+against `nodes.json`'s `element_id`, same best-effort matching as LogEvents),
+and returns `201` with a minimal `DiscrepancyReportResponse` — no `GET
+.../StatusUpdates` or `.../Resolutions` polling, and no resolution is ever
+issued back to the reporter.
+
 ## Scope
 
 This is a local dev/ops tool: single process, in-memory ring buffer (2000
@@ -80,5 +101,5 @@ touching `lvf-service` or `i3-fe-core`.
 - [x] LogEvent receiver + live feed
 - [x] Persistent SIP subscriber (ElementState/ServiceState) + live feed
 - [x] Multi-node config, per-node SIP subscriber, source/role attribution + filtering
-- [ ] Discrepancy Reporting peer (receive reports filed via `LVF_DR_ENDPOINT`)
+- [x] Discrepancy Reporting peer (receive reports filed via `LVF_DR_ENDPOINT`)
 - [ ] Prometheus `/metrics` scrape + summary tiles per node

@@ -71,6 +71,31 @@ _LOG_EVENT_KIND = {
     "VersionsLogEvent": "log_other",
 }
 
+# §3.7.1 DiscrepancyReport MANDATORY prolog fields (i3-fe-core
+# discrepancy/models.py DiscrepancyReport._require call in from_dict).
+_DR_REQUIRED_FIELDS = (
+    "resolutionUri",
+    "reportType",
+    "discrepancyReportSubmittalTimeStamp",
+    "discrepancyReportId",
+    "reportingAgencyName",
+    "reportingContactJcard",
+    "problemSeverity",
+)
+
+# This portal's own identity for the MANDATORY DiscrepancyReportResponse
+# fields (§3.7.1) — it isn't a real i3 element, so a minimal, clearly-labeled
+# jCard (RFC 7095) is enough for a conformant reporter to accept the 201.
+_DR_RESPONDING_AGENCY_NAME = "i3-admin-portal"
+_DR_RESPONDING_CONTACT_JCARD = [
+    "vcard",
+    [
+        ["version", {}, "text", "4.0"],
+        ["fn", {}, "text", _DR_RESPONDING_AGENCY_NAME],
+        ["kind", {}, "text", "org"],
+    ],
+]
+
 
 def _classify(body: dict) -> tuple[str, str, str, str]:
     """Returns (kind, summary, source, role). Source/role come from matching
@@ -164,6 +189,56 @@ async def receive_log_event(request: Request):
         sub.note_alive()
     store.add(kind, summary, body, source=source, role=role)
     return JSONResponse({"status": "accepted"}, status_code=201)
+
+
+@app.post("/Reports")
+async def receive_discrepancy_report(request: Request):
+    """§3.7.1 DR web service: matches i3-fe-core's DiscrepancyReporting.submit()
+    POST target, {resolutionUri-style base}/Reports (discrepancy/service.py).
+    Passive receiver: accept, log, acknowledge — no resolution workflow, no
+    reporter authorization/known-problem-service gating (this is a dev
+    observability tool, not a responding FE)."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"reason": "body is not a JSON object"}, status_code=454)
+    if not isinstance(body, dict):
+        return JSONResponse({"reason": "body is not a JSON object"}, status_code=454)
+
+    missing = [k for k in _DR_REQUIRED_FIELDS if not body.get(k)]
+    if missing:
+        return JSONResponse(
+            {"reason": f"missing MANDATORY field(s) {missing} (§3.7.1)"}, status_code=454
+        )
+
+    report_type = body.get("reportType", "Unknown")
+    short_description = body.get("problemComments") or body.get("problemService") or ""
+
+    reporting_agency = body.get("reportingAgencyName")
+    node = _element_id_index.get(reporting_agency) if reporting_agency else None
+    if node:
+        source, role = node.name, node.role
+    else:
+        source, role = reporting_agency or "unknown", "?"
+
+    # A node filing a DR is proof it's alive right now, same as /LogEvents.
+    sub = subscribers.get(source)
+    if sub:
+        sub.note_alive()
+
+    store.add(
+        "dr_received",
+        f"DR received: {report_type} — {short_description}",
+        body,
+        source=source,
+        role=role,
+    )
+
+    response = {
+        "respondingAgencyName": _DR_RESPONDING_AGENCY_NAME,
+        "respondingContactJcard": _DR_RESPONDING_CONTACT_JCARD,
+    }
+    return JSONResponse(response, status_code=201)
 
 
 @app.post("/api/clear")

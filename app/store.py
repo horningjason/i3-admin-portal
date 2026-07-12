@@ -17,7 +17,7 @@ from typing import Any
 @dataclass
 class Event:
     id: int
-    kind: str  # log_query|log_response|log_state|log_dr|log_subscribe|log_other|sip_subscribe|sip_notify
+    kind: str  # log_query|log_response|log_state|log_dr|log_subscribe|log_other|sip_subscribe|sip_notify|dr_received
     timestamp: str
     summary: str
     detail: dict[str, Any] = field(default_factory=dict)

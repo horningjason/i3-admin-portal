@@ -217,6 +217,28 @@ class PersistentSipSubscriber:
         call_id = self._call_ids[package]
         tag = uuid.uuid4().hex[:8]
         branch = f"z9hG4bK{uuid.uuid4().hex[:16]}"
+
+        # RFC 4661 / RFC 6446 event rate control: the minimum notification
+        # interval is a filter document in the SUBSCRIBE body, not an Event
+        # header parameter. A rate filter with <min-interval> asks the
+        # notifier to space NOTIFYs at least this far apart (the §2.4
+        # watchdog mechanism). Omitted on unsubscribe (expires == 0), which
+        # carries no body.
+        body = ""
+        extra_headers = ""
+        if expires > 0:
+            body = (
+                '<?xml version="1.0" encoding="UTF-8"?>\r\n'
+                '<filter-set xmlns="urn:ietf:params:xml:ns:simple-filter">\r\n'
+                f'  <filter id="rate-{package}">\r\n'
+                '    <what>\r\n'
+                f'      <min-interval>{WATCHDOG_INTERVAL_SECONDS}</min-interval>\r\n'
+                '    </what>\r\n'
+                '  </filter>\r\n'
+                '</filter-set>\r\n'
+            )
+            extra_headers = "Content-Type: application/simple-filter+xml\r\n"
+
         msg = (
             f"SUBSCRIBE sip:{self._node.name}@{host}:{port} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={branch}\r\n"
@@ -225,10 +247,13 @@ class PersistentSipSubscriber:
             f"Call-ID: {call_id}\r\n"
             f"CSeq: {self._cseq[package]} SUBSCRIBE\r\n"
             f"Contact: <sip:i3-admin-portal@{self._local_ip}:{self._local_port}>\r\n"
-            f"Event: {package};min-interval={WATCHDOG_INTERVAL_SECONDS}\r\n"
+            f"Event: {package}\r\n"
+            f"Accept: Application/EmergencyCallData.{'ElementState' if 'ElementState' in package else 'ServiceState'}+json\r\n"
             f"Max-Forwards: 70\r\n"
             f"Expires: {expires}\r\n"
-            f"Content-Length: 0\r\n\r\n"
+            f"{extra_headers}"
+            f"Content-Length: {len(body.encode())}\r\n\r\n"
+            f"{body}"
         )
         self._transport.sendto(msg.encode(), (host, port))
         action = "unsubscribe" if expires == 0 else ("refresh" if self._cseq[package] > 1 else "subscribe")
@@ -264,6 +289,29 @@ class PersistentSipSubscriber:
         if first_line.startswith("NOTIFY"):
             event_pkg = _header(lines, "Event").split(":", 1)[-1].strip() or "unknown"
             sub_state = _header(lines, "Subscription-State").split(":", 1)[-1].strip()
+
+            # RFC 6665 §4.4.1: only accept a NOTIFY that belongs to a
+            # subscription dialog we actually created. Match on Call-ID
+            # against the Call-IDs we used when subscribing. A NOTIFY whose
+            # Call-ID we don't recognise gets 481 (Subscription Does Not
+            # Exist), not a 200 — this is what a conformant subscriber does
+            # and prevents this tool from silently blessing stray NOTIFYs.
+            notify_call_id = _header(lines, "Call-ID").split(":", 1)[-1].strip()
+            known_call_ids = set(self._call_ids.values())
+            if notify_call_id not in known_call_ids:
+                log.warning(
+                    "%s: NOTIFY with unknown Call-ID %r (not one of our "
+                    "subscriptions) — responding 481",
+                    self._node.name, notify_call_id,
+                )
+                self._add(
+                    "sip_notify",
+                    f"NOTIFY {event_pkg} — REJECTED 481 (unknown subscription)",
+                    {"package": event_pkg, "callId": notify_call_id, "rejected": "481"},
+                )
+                self._respond_notify(lines, addr, "481 Subscription Does Not Exist")
+                return
+
             parsed_body: object = body
             try:
                 parsed_body = json.loads(body) if body.strip() else {}
@@ -274,13 +322,15 @@ class PersistentSipSubscriber:
                 f"NOTIFY {event_pkg} ({sub_state})",
                 {"package": event_pkg, "subscriptionState": sub_state, "body": parsed_body},
             )
-            self._ack_notify(lines, addr)
+            self._respond_notify(lines, addr, "200 OK")
 
-    def _ack_notify(self, request_lines: list[str], addr) -> None:
+    def _respond_notify(self, request_lines: list[str], addr, status_line: str) -> None:
+        """Send a SIP response to an inbound NOTIFY. status_line is the text
+        after 'SIP/2.0 ', e.g. '200 OK' or '481 Subscription Does Not Exist'."""
         if not self._transport:
             return
         resp = (
-            "SIP/2.0 200 OK\r\n"
+            f"SIP/2.0 {status_line}\r\n"
             f"{_header(request_lines, 'Via')}\r\n"
             f"{_header(request_lines, 'From')}\r\n"
             f"{_header(request_lines, 'To')}\r\n"

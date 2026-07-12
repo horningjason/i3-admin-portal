@@ -152,11 +152,17 @@
   main {
     display: grid;
     grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr auto;
     gap: 1px;
     background: var(--gridline);
     flex: 1;
     min-height: 0;
   }
+  /* DR panel spans both columns along the bottom */
+  .panel.dr { grid-column: 1 / -1; }
+  /* cap the DR panel height so the two live feeds keep the room; the DR
+     table scrolls internally */
+  .panel.dr .rows { max-height: 220px; }
   .panel {
     background: var(--page);
     display: flex;
@@ -277,6 +283,10 @@
     <h2>SIP State Notifications (§2.4)</h2>
     <div class="rows" id="rows-sip"></div>
   </div>
+  <div class="panel dr">
+    <h2>Discrepancy Reports Received (i3 §3.7)</h2>
+    <div class="rows" id="rows-dr"></div>
+  </div>
 </main>
 
 <script>
@@ -289,6 +299,7 @@ const KIND_META = {
   log_other:     { label: "Other",          color: "var(--log-other)",     panel: "log" },
   sip_subscribe: { label: "SUBSCRIBE",      color: "var(--sip-subscribe)", panel: "sip" },
   sip_notify:    { label: "NOTIFY",         color: "var(--sip-notify)",    panel: "sip" },
+  dr_received:   { label: "DR Received",    color: "var(--log-dr)",       panel: "dr" },
 };
 
 const activeKinds = new Set(Object.keys(KIND_META));
@@ -296,6 +307,7 @@ const activeSources = new Set();   // populated once nodes/events are known
 const knownSources = new Set();
 const rowsLog = document.getElementById("rows-log");
 const rowsSip = document.getElementById("rows-sip");
+const rowsDr = document.getElementById("rows-dr");
 const filtersEl = document.getElementById("filters");
 const filtersSourceEl = document.getElementById("filters-source");
 const nodesEl = document.getElementById("nodes");
@@ -374,7 +386,9 @@ function shortTime(iso) {
 
 function renderRow(event, prepend) {
   const meta = KIND_META[event.kind] || KIND_META.log_other;
-  const target = meta.panel === "sip" ? rowsSip : rowsLog;
+  const target = meta.panel === "sip" ? rowsSip
+               : meta.panel === "dr"  ? rowsDr
+               : rowsLog;
   const empty = target.querySelector(".empty");
   if (empty) empty.remove();
 
@@ -464,7 +478,7 @@ function formatDetail(detail) {
 }
 
 function markEmptyIfNeeded() {
-  for (const target of [rowsLog, rowsSip]) {
+  for (const target of [rowsLog, rowsSip, rowsDr]) {
     if (!target.querySelector(".row")) {
       const empty = document.createElement("div");
       empty.className = "empty";
@@ -478,6 +492,7 @@ document.getElementById("btn-clear").addEventListener("click", async () => {
   await fetch("/api/clear", { method: "POST" });
   rowsLog.innerHTML = "";
   rowsSip.innerHTML = "";
+  rowsDr.innerHTML = "";
   total = 0;
   statCount.textContent = total;
   statLast.textContent = "—";
