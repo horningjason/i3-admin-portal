@@ -382,7 +382,7 @@ function renderRow(event, prepend) {
   `;
   const detail = document.createElement("div");
   detail.className = "detail";
-  detail.textContent = JSON.stringify(event.detail, null, 2);
+  detail.textContent = formatDetail(event.detail);
   row.addEventListener("click", () => detail.classList.toggle("open"));
 
   if (prepend) {
@@ -398,6 +398,58 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
+}
+
+// LostQueryLogEvent/LostResponseLogEvent carry the entire LoST request or
+// response as a raw XML string (queryAdapter/responseAdapter). Detect any
+// string field that looks like XML and reformat it with real indentation
+// instead of leaving it as one escaped line inside JSON.stringify output.
+function looksLikeXml(value) {
+  return typeof value === "string" && /^\s*<\??[a-zA-Z]/.test(value);
+}
+
+function prettyXml(xml) {
+  try {
+    const dom = new DOMParser().parseFromString(xml, "application/xml");
+    if (dom.querySelector("parsererror")) return xml;
+    return formatXmlNode(dom.documentElement, 0).trimEnd();
+  } catch (e) {
+    return xml;
+  }
+}
+
+function formatXmlNode(node, depth) {
+  const pad = "  ".repeat(depth);
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = node.nodeValue.trim();
+    return text ? `${pad}${text}\n` : "";
+  }
+  let attrs = "";
+  for (const a of node.attributes || []) attrs += ` ${a.name}="${a.value}"`;
+  const children = Array.from(node.childNodes || [])
+    .filter(c => c.nodeType !== Node.TEXT_NODE || c.nodeValue.trim());
+  if (children.length === 0) return `${pad}<${node.nodeName}${attrs}/>\n`;
+  if (children.length === 1 && children[0].nodeType === Node.TEXT_NODE) {
+    return `${pad}<${node.nodeName}${attrs}>${children[0].nodeValue.trim()}</${node.nodeName}>\n`;
+  }
+  let out = `${pad}<${node.nodeName}${attrs}>\n`;
+  for (const child of children) out += formatXmlNode(child, depth + 1);
+  out += `${pad}</${node.nodeName}>\n`;
+  return out;
+}
+
+function formatDetail(detail) {
+  const lines = [];
+  for (const [key, value] of Object.entries(detail)) {
+    if (looksLikeXml(value)) {
+      lines.push(`${key}:\n${prettyXml(value)}`);
+    } else if (typeof value === "object" && value !== null) {
+      lines.push(`${key}: ${JSON.stringify(value, null, 2)}`);
+    } else {
+      lines.push(`${key}: ${JSON.stringify(value)}`);
+    }
+  }
+  return lines.join("\n\n");
 }
 
 function markEmptyIfNeeded() {
