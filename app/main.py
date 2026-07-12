@@ -156,6 +156,12 @@ async def receive_log_event(request: Request):
     """Matches i3-fe-core LoggingClient's POST target: {uri}/LogEvents."""
     body = await request.json()
     kind, summary, source, role = _classify(body)
+    # A node POSTing a LogEvent is proof it's alive right now — feed that into
+    # liveness so an actively-working node shows green immediately, without
+    # waiting on the next OPTIONS ping.
+    sub = subscribers.get(source)
+    if sub:
+        sub.note_alive()
     store.add(kind, summary, body, source=source, role=role)
     return JSONResponse({"status": "accepted"}, status_code=201)
 

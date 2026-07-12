@@ -32,14 +32,26 @@ SUBSCRIBE_EXPIRES = 300
 REFRESH_MARGIN = 30
 PACKAGES = ("emergency-ElementState", "emergency-ServiceState")
 
-# §2.4.1/§2.4.2: "Filter requests MAY specify a minimum notification
-# interval... This can be used as a watchdog mechanism." An admin/ops
-# dashboard is exactly the subscriber that *should* opt into that watchdog —
-# we request it explicitly so a node going dark is detected in roughly
-# WATCHDOG_INTERVAL * STALE_MULTIPLIER seconds instead of waiting up to the
-# full 270s SUBSCRIBE refresh cycle (and even then, only a live SIP node can
-# ever tell us about itself going away — an outright killed container can't).
-WATCHDOG_INTERVAL_SECONDS = 30
+# Liveness has two independent channels, because state *changes* and node
+# *death* are fundamentally different problems:
+#
+#   * State changes (Active→Overloaded→GoingDown, etc.) arrive as NOTIFYs —
+#     a real-time push. The portal learns of them within milliseconds. That
+#     part is pure §2.4 SUBSCRIBE/NOTIFY and needs no polling.
+#   * Ungraceful death (crash, power-off, cut cable) can't be pushed — a dead
+#     node can't announce it's dead. The only way to detect silence is to
+#     expect a beat and notice its absence, so we actively probe.
+#
+# We probe with SIP OPTIONS (RFC 3261 §11) every WATCHDOG_INTERVAL_SECONDS —
+# the canonical SIP liveness ping. Any live endpoint MUST answer, and unlike a
+# re-SUBSCRIBE it doesn't disturb the subscription or trigger NOTIFY/log noise.
+# Any inbound datagram (OPTIONS ack, NOTIFY, SUBSCRIBE 200) — plus a matching
+# inbound LogEvent via note_alive() — counts as proof of life. A node is called
+# unreachable only after WATCHDOG_INTERVAL_SECONDS * STALE_MULTIPLIER of total
+# silence, so a couple of dropped UDP pings won't flap it. We also still request
+# min-interval on the SUBSCRIBE (§2.4.1/§2.4.2's optional watchdog) as a bonus
+# in case the FE honors it, but we no longer depend on it.
+WATCHDOG_INTERVAL_SECONDS = 15
 STALE_MULTIPLIER = 3  # tolerate a couple missed heartbeats before calling it unreachable
 
 
@@ -88,9 +100,12 @@ class PersistentSipSubscriber:
         self._call_ids: dict[str, str] = {}
         self._cseq: dict[str, int] = {p: 0 for p in PACKAGES}
         self._refresh_tasks: dict[str, asyncio.Task] = {}
+        self._probe_task: asyncio.Task | None = None
+        self._options_call_id = f"portal-opt-{uuid.uuid4().hex[:12]}"
+        self._options_cseq = 0
         self._local_ip = _local_ip_for(node.sip_host, node.sip_port)
         self.is_active = False
-        self._last_heard_mono: float | None = None  # monotonic time of last datagram received
+        self._last_heard_mono: float | None = None  # monotonic time of last proof-of-life
 
     @property
     def status(self) -> str:
@@ -104,6 +119,17 @@ class PersistentSipSubscriber:
             return "live"
         return "unreachable"
 
+    def note_alive(self) -> None:
+        """Record proof of life from a channel other than this SIP socket.
+
+        Called when an inbound LogEvent (§4.12.3) is attributed to this node:
+        a node POSTing LogEvents is unambiguously alive and doing its job, even
+        if its SIP notify path is momentarily quiet. This can only ever promote
+        a node to 'live' — an idle node sends no LogEvents, so the OPTIONS probe
+        remains the baseline that can call a node unreachable.
+        """
+        self._last_heard_mono = time.monotonic()
+
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
@@ -116,9 +142,12 @@ class PersistentSipSubscriber:
             self._call_ids[package] = f"portal-{uuid.uuid4().hex[:12]}"
             self._subscribe(package, SUBSCRIBE_EXPIRES)
             self._refresh_tasks[package] = asyncio.create_task(self._refresh_loop(package))
+        self._probe_task = asyncio.create_task(self._probe_loop())
 
     async def stop(self) -> None:
         self.is_active = False
+        if self._probe_task:
+            self._probe_task.cancel()
         for task in self._refresh_tasks.values():
             task.cancel()
         for package in PACKAGES:
@@ -134,6 +163,37 @@ class PersistentSipSubscriber:
                 self._subscribe(package, SUBSCRIBE_EXPIRES)
         except asyncio.CancelledError:
             pass
+
+    async def _probe_loop(self) -> None:
+        """Watchdog: ping with SIP OPTIONS every WATCHDOG_INTERVAL_SECONDS so a
+        node that has gone silent is detected without waiting on the 270s
+        SUBSCRIBE refresh. Probe immediately, then on the interval."""
+        try:
+            while True:
+                self._send_options()
+                await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    def _send_options(self) -> None:
+        if not self._transport:
+            return
+        host, port = self._node.sip_host, self._node.sip_port
+        self._options_cseq += 1
+        tag = uuid.uuid4().hex[:8]
+        branch = f"z9hG4bK{uuid.uuid4().hex[:16]}"
+        msg = (
+            f"OPTIONS sip:{self._node.name}@{host}:{port} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={branch}\r\n"
+            f"From: <sip:i3-admin-portal@{self._local_ip}>;tag={tag}\r\n"
+            f"To: <sip:{self._node.name}@{host}>\r\n"
+            f"Call-ID: {self._options_call_id}\r\n"
+            f"CSeq: {self._options_cseq} OPTIONS\r\n"
+            f"Contact: <sip:i3-admin-portal@{self._local_ip}:{self._local_port}>\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Length: 0\r\n\r\n"
+        )
+        self._transport.sendto(msg.encode(), (host, port))
 
     def _add(self, kind: str, summary: str, detail: dict) -> None:
         self._store.add(kind, summary, detail, source=self._node.name, role=self._node.role)
@@ -175,6 +235,8 @@ class PersistentSipSubscriber:
         self._last_heard_mono = time.monotonic()
 
         if first_line.startswith("SIP/2.0"):
+            if "OPTIONS" in _header(lines, "CSeq").upper():
+                return  # watchdog ping ack — liveness already updated above, don't log noise
             min_expires = _header(lines, "Min-Expires")
             self._add(
                 "sip_subscribe",
