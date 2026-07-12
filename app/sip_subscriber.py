@@ -84,23 +84,6 @@ def _header(lines: list[str], name: str) -> str:
     return next((l for l in lines if l.lower().startswith(prefix)), "")
 
 
-def _local_ip_for(host: str, port: int) -> str:
-    """The local IP the OS would actually use to reach (host, port).
-
-    socket.gethostbyname(socket.gethostname()) is unreliable on multi-homed
-    boxes (VPN/WSL/Docker adapters) — it can return an address that can't
-    route a reply back, silently breaking NOTIFY delivery. Connecting a UDP
-    socket doesn't send any packets; it just asks the OS routing table which
-    local interface it would use, which is what a Contact/Via header needs.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            s.connect((host, port))
-            return s.getsockname()[0]
-        except OSError:
-            return "127.0.0.1"
-
-
 class PersistentSipSubscriber:
     def __init__(self, node: "Node", store: "EventStore", local_port: int = 0) -> None:
         self._node = node
@@ -117,7 +100,7 @@ class PersistentSipSubscriber:
         self._options_cseq = 0
         self._options_since_ack = 0  # OPTIONS pings sent with no ack — flags an FE that ignores OPTIONS
         self._options_warned = False
-        self._local_ip = _local_ip_for(node.sip_host, node.sip_port)
+        self._local_ip: str | None = None
         self.is_active = False
         self._last_heard_mono: float | None = None  # monotonic time of last proof-of-life
         self._resolved_ip: str | None = None
@@ -174,6 +157,34 @@ class PersistentSipSubscriber:
             return None
         self._resolved_ip = infos[0][4][0]
         return self._resolved_ip
+
+    async def _resolve_local_ip(self) -> str | None:
+        """The local IP the OS would actually use to reach the node, resolved
+        once and cached. Returns None (and leaves the cache unset) if
+        resolution/routing fails, so callers can skip this send attempt and
+        retry later rather than baking in a wrong address.
+
+        socket.gethostbyname(socket.gethostname()) is unreliable on
+        multi-homed boxes (VPN/WSL/Docker adapters) — it can return an
+        address that can't route a reply back, silently breaking NOTIFY
+        delivery. Connecting a UDP socket doesn't send any packets; it just
+        asks the OS routing table which local interface it would use, which
+        is what a Contact/Via header needs.
+        """
+        if self._local_ip is not None:
+            return self._local_ip
+        resolved_ip = await self._resolve_host()
+        if resolved_ip is None:
+            return None
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                s.connect((resolved_ip, self._node.sip_port))
+                self._local_ip = s.getsockname()[0]
+            except OSError:
+                log.debug("%s: could not determine local IP for %r, will retry",
+                          self._node.name, resolved_ip)
+                return None
+        return self._local_ip
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -260,6 +271,9 @@ class PersistentSipSubscriber:
         if resolved_ip is None:
             log.debug("%s: skipping OPTIONS ping, host not yet resolved", self._node.name)
             return
+        if await self._resolve_local_ip() is None:
+            log.debug("%s: skipping OPTIONS ping, local IP not yet resolved", self._node.name)
+            return
         host, port = self._node.sip_host, self._node.sip_port
         self._options_cseq += 1
         tag = uuid.uuid4().hex[:8]
@@ -295,6 +309,9 @@ class PersistentSipSubscriber:
         resolved_ip = await self._resolve_host()
         if resolved_ip is None:
             log.debug("%s: skipping SUBSCRIBE for %s, host not yet resolved", self._node.name, package)
+            return
+        if await self._resolve_local_ip() is None:
+            log.debug("%s: skipping SUBSCRIBE for %s, local IP not yet resolved", self._node.name, package)
             return
         host, port = self._node.sip_host, self._node.sip_port
         self._cseq[package] += 1
