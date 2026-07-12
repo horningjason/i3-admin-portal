@@ -96,6 +96,16 @@
     letter-spacing: .04em;
   }
   .spacer { flex: 1; }
+  .btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn:hover { background: var(--surface-1); color: var(--text-primary); }
 
   .filters {
     display: flex; flex-wrap: wrap; gap: 6px;
@@ -250,6 +260,7 @@
     <span class="label">Nodes live</span>
   </div>
   <div class="spacer"></div>
+  <button class="btn" id="btn-clear">Clear</button>
 </header>
 
 <div class="nodes" id="nodes"></div>
@@ -462,6 +473,16 @@ function markEmptyIfNeeded() {
     }
   }
 }
+
+document.getElementById("btn-clear").addEventListener("click", async () => {
+  await fetch("/api/clear", { method: "POST" });
+  rowsLog.innerHTML = "";
+  rowsSip.innerHTML = "";
+  total = 0;
+  statCount.textContent = total;
+  statLast.textContent = "—";
+  markEmptyIfNeeded();
+});
 
 buildFilters();
 loadNodes();

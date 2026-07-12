@@ -166,6 +166,13 @@ async def receive_log_event(request: Request):
     return JSONResponse({"status": "accepted"}, status_code=201)
 
 
+@app.post("/api/clear")
+async def clear_events():
+    """Wipe the in-memory event buffer from the dashboard's Clear button."""
+    store.clear()
+    return JSONResponse({"status": "cleared"})
+
+
 @app.get("/health")
 async def health():
     return {

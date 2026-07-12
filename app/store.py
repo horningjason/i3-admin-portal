@@ -66,5 +66,8 @@ class EventStore:
     def unsubscribe(self, queue: asyncio.Queue[Event]) -> None:
         self._subscribers.discard(queue)
 
+    def clear(self) -> None:
+        self._events.clear()
+
 
 store = EventStore()
