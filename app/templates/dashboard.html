@@ -27,6 +27,10 @@
     --status-warning:  #fab219;
     --status-serious:  #ec835a;
     --status-critical: #d03b3b;
+
+    --status-good-bg:     rgba(12,163,12,0.12);
+    --status-warning-bg:  rgba(250,178,25,0.14);
+    --status-critical-bg: rgba(208,59,59,0.14);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -224,6 +228,30 @@
     flex: 1;
     word-break: break-word;
   }
+  .state-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    white-space: nowrap;
+    flex: none;
+  }
+  .row.tint-warning { background: var(--status-warning-bg); }
+  .row.tint-critical { background: var(--status-critical-bg); }
+  .heartbeat-row {
+    cursor: default;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface-1);
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  .heartbeat-row .summary { color: var(--text-muted); }
   .detail {
     display: none;
     margin: 0 16px 10px 16px;
@@ -349,39 +377,176 @@ function ensureSourceChip(name) {
 
 function applyFilter() {
   document.querySelectorAll(".row").forEach(r => {
+    if (r.classList.contains("heartbeat-row")) {
+      r.style.display = activeKinds.has("sip_notify") ? "" : "none";
+      return;
+    }
     r.style.display = (activeKinds.has(r.dataset.kind) && activeSources.has(r.dataset.source)) ? "" : "none";
   });
 }
 
+// Cache of the last /api/nodes response so renderNodeChips() can be
+// re-run whenever sipLastState changes (Change 4), not only on the
+// 10s poll — without re-fetching.
+let lastNodeList = [];
+
 async function loadNodes() {
   try {
     const res = await fetch("/api/nodes");
-    const nodeList = await res.json();
-    nodesEl.innerHTML = "";
-    let live = 0;
-    for (const n of nodeList) {
-      ensureSourceChip(n.name);
-      if (n.sip_status === "live") live += 1;
-      const chip = document.createElement("div");
-      chip.className = "node-chip";
-      const dotColor = !n.has_sip ? "var(--text-muted)"
-                      : n.sip_status === "live" ? "var(--status-good)"
-                      : n.sip_status === "unreachable" ? "var(--status-critical)"
-                      : "var(--status-warning)";
-      const statusLabel = !n.has_sip ? "" : n.sip_status === "unreachable" ? " (unreachable)" : "";
-      chip.innerHTML = `<span class="conn-dot" style="background:${dotColor};margin-right:0"></span>
-                         <span class="role-tag">${escapeHtml(n.role)}</span> ${escapeHtml(n.name)}${statusLabel}`;
-      nodesEl.appendChild(chip);
-    }
-    statNodes.textContent = `${live}/${nodeList.filter(n => n.has_sip).length}`;
+    lastNodeList = await res.json();
+    renderNodeChips();
   } catch (e) {
     statNodes.textContent = "?";
   }
 }
 
+function renderNodeChips() {
+  nodesEl.innerHTML = "";
+  let live = 0;
+  for (const n of lastNodeList) {
+    ensureSourceChip(n.name);
+    if (n.sip_status === "live") live += 1;
+    const chip = document.createElement("div");
+    chip.className = "node-chip";
+    const dotColor = !n.has_sip ? "var(--text-muted)"
+                    : n.sip_status === "live" ? "var(--status-good)"
+                    : n.sip_status === "unreachable" ? "var(--status-critical)"
+                    : "var(--status-warning)";
+    const statusLabel = !n.has_sip ? "" : n.sip_status === "unreachable" ? " (unreachable)" : "";
+    const elementState = sipLastState[`${n.name}|emergency-ElementState`];
+    chip.innerHTML = `<span class="conn-dot" style="background:${dotColor};margin-right:0"></span>
+                       <span class="role-tag">${escapeHtml(n.role)}</span> ${escapeHtml(n.name)}${statusLabel}
+                       ${stateChipHtml(elementState)}`;
+    nodesEl.appendChild(chip);
+  }
+  statNodes.textContent = `${live}/${lastNodeList.filter(n => n.has_sip).length}`;
+}
+
 function shortTime(iso) {
   const d = new Date(iso);
   return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+// ---- Intent-first summaries (Change 2) --------------------------------
+// These read the same event.detail the server already sends; only the
+// displayed summary text is rebuilt here. event.detail itself (shown in
+// the expandable section via formatDetail) is left untouched.
+
+const PEER_FIELD_CANDIDATES = [
+  "targetUri", "target", "recipientUri", "requestUri",
+  "remoteUri", "sourceUri", "viaUri", "uri", "serviceUrn",
+];
+
+function derivePeer(detail) {
+  for (const key of PEER_FIELD_CANDIDATES) {
+    const v = detail[key];
+    if (typeof v === "string" && v.trim()) return shortenUri(v);
+  }
+  return null;
+}
+
+function shortenUri(uri) {
+  const m = uri.match(/^[a-zA-Z][\w+.-]*:(?:\/\/)?([^/?#]+)/);
+  return m ? m[1] : uri;
+}
+
+function deriveQueryLikeSummary(event, label) {
+  const detail = event.detail || {};
+  const direction = String(detail.direction || "").toLowerCase();
+  const peer = derivePeer(detail);
+  if (!peer) return `${event.source} · ${label}`;
+  return direction === "incoming"
+    ? `${peer} → ${event.source} · ${label}`
+    : `${event.source} → ${peer} · ${label}`;
+}
+
+function deriveResponseSummary(event) {
+  const detail = event.detail || {};
+  const valid = detail.valid === true || detail.isValid === true
+    || /^valid$/i.test(String(detail.responseType || ""))
+    || /^valid$/i.test(String(detail.status || ""));
+  return deriveQueryLikeSummary(event, valid ? "valid" : "response");
+}
+
+function deriveLogStateSummary(event) {
+  const state = extractLogState(event.detail || {});
+  return `${event.source} is now ${state || "?"}`;
+}
+
+function deriveNotifySummary(event) {
+  const detail = event.detail || {};
+  const state = extractNotifyState(detail);
+  return `${event.source} ${shortPackage(detail.package)} → ${state || "?"}`;
+}
+
+function deriveSubscribeSummary(event) {
+  const action = (event.detail && event.detail.action) || "";
+  if (action === "unsubscribe") return `${event.source} subscription ended`;
+  if (action === "refresh") return `${event.source} subscription refreshed`;
+  if (action === "subscribe") return `portal now watching ${event.source}`;
+  return event.summary;
+}
+
+function computeSummary(event) {
+  switch (event.kind) {
+    case "log_query":    return deriveQueryLikeSummary(event, "address query");
+    case "log_response": return deriveResponseSummary(event);
+    case "log_state":    return deriveLogStateSummary(event);
+    case "sip_notify":   return deriveNotifySummary(event);
+    case "sip_subscribe": return deriveSubscribeSummary(event);
+    default: return event.summary;
+  }
+}
+
+// ---- State extraction + coloring (Change 3 / Change 4) ----------------
+
+function shortPackage(pkg) {
+  return String(pkg || "").replace(/^emergency-/, "");
+}
+
+function extractLogState(detail) {
+  if (detail.logEventType === "ServiceStateChangeLogEvent") {
+    return detail.newState || null;
+  }
+  if (detail.logEventType === "ElementStateChangeLogEvent") {
+    return (detail.notificationContents && detail.notificationContents.state) || null;
+  }
+  return detail.newState || (detail.notificationContents && detail.notificationContents.state) || null;
+}
+
+function extractNotifyState(detail) {
+  const body = detail.body || {};
+  if (detail.package === "emergency-ServiceState") {
+    return (body.serviceState && body.serviceState.state) || null;
+  }
+  return body.state || null; // emergency-ElementState
+}
+
+function extractDisplayState(event) {
+  const detail = event.detail || {};
+  if (event.kind === "log_state") return extractLogState(detail);
+  if (event.kind === "sip_notify") return extractNotifyState(detail);
+  return null;
+}
+
+const STATE_CRITICAL = new Set(["GoingDown", "ServiceDisruption", "Unreachable"]);
+
+// Normal -> good (green). GoingDown/ServiceDisruption/Unreachable -> critical
+// (red). Any other non-Normal state (Overloaded, or anything unrecognized)
+// defaults to warning (amber).
+function stateSeverity(state) {
+  if (!state) return null;
+  if (state === "Normal") return "good";
+  if (STATE_CRITICAL.has(state)) return "critical";
+  return "warning";
+}
+
+function stateChipHtml(state) {
+  if (!state) return "";
+  const sev = stateSeverity(state);
+  const fg = sev === "good" ? "var(--status-good)" : sev === "critical" ? "var(--status-critical)" : "var(--status-warning)";
+  const bg = sev === "good" ? "var(--status-good-bg)" : sev === "critical" ? "var(--status-critical-bg)" : "var(--status-warning-bg)";
+  return `<span class="state-chip" style="color:${fg};background:${bg};border-color:${fg}">${escapeHtml(state)}</span>`;
 }
 
 function renderRow(event, prepend) {
@@ -394,8 +559,17 @@ function renderRow(event, prepend) {
 
   ensureSourceChip(event.source);
 
+  const summaryText = computeSummary(event);
+  const state = extractDisplayState(event);
+  // Every log_state event is itself a change; a sip_notify only reaches
+  // renderRow at all when it's a real (non-heartbeat) transition — see
+  // handleSipNotify(). So "tint if non-Normal" is safe for both here.
+  const isChangeKind = event.kind === "log_state" || event.kind === "sip_notify";
+  const sev = isChangeKind ? stateSeverity(state) : null;
+  const tintClass = sev === "critical" ? " tint-critical" : sev === "warning" ? " tint-warning" : "";
+
   const row = document.createElement("div");
-  row.className = "row";
+  row.className = "row" + tintClass;
   row.dataset.kind = event.kind;
   row.dataset.source = event.source;
   row.style.display = (activeKinds.has(event.kind) && activeSources.has(event.source)) ? "" : "none";
@@ -403,7 +577,8 @@ function renderRow(event, prepend) {
     <span class="time">${shortTime(event.timestamp)}</span>
     <span class="badge" style="color:${meta.color}"><span class="dot" style="background:${meta.color}"></span>${meta.label}</span>
     <span class="source-tag"><span class="role">${escapeHtml(event.role)}</span> ${escapeHtml(event.source)}</span>
-    <span class="summary">${escapeHtml(event.summary)}</span>
+    <span class="summary">${escapeHtml(summaryText)}</span>
+    ${stateChipHtml(state)}
   `;
   const detail = document.createElement("div");
   detail.className = "detail";
@@ -417,6 +592,76 @@ function renderRow(event, prepend) {
     target.appendChild(row);
     target.appendChild(detail);
   }
+
+  // Keep the heartbeat summary row pinned as the first child of the SIP
+  // panel even as new rows get prepended above it live.
+  if (prepend && target === rowsSip && heartbeatRowEl) {
+    rowsSip.prepend(heartbeatRowEl);
+  }
+}
+
+// ---- SIP NOTIFY heartbeat collapsing (Change 1) ------------------------
+// Every WATCHDOG_INTERVAL_SECONDS each node re-sends a NOTIFY with an
+// unchanged state — pure proof-of-life. Collapse those into one rolling
+// summary row instead of one row per ping, so real transitions aren't
+// buried. Keyed by `${source}|${package}` since a node reports two
+// independent packages (ElementState/ServiceState).
+const sipLastState = {};
+const heartbeatWindow = []; // [{ source, ts }], ts = event time (ms)
+const HEARTBEAT_WINDOW_MS = 90_000;
+let heartbeatRowEl = null;
+
+function handleSipNotify(event, prepend) {
+  const detail = event.detail || {};
+  const pkg = detail.package;
+  const state = extractNotifyState(detail);
+  const key = `${event.source}|${pkg}`;
+  const isFirst = !(key in sipLastState);
+  const changed = isFirst || sipLastState[key] !== state;
+  sipLastState[key] = state;
+
+  if (changed) {
+    renderRow(event, prepend);
+    renderNodeChips();
+  } else {
+    recordHeartbeat(event.source, event.timestamp);
+  }
+}
+
+function pruneHeartbeatWindow(now) {
+  const cutoff = now - HEARTBEAT_WINDOW_MS;
+  while (heartbeatWindow.length && heartbeatWindow[0].ts < cutoff) heartbeatWindow.shift();
+}
+
+function recordHeartbeat(source, timestamp) {
+  heartbeatWindow.push({ source, ts: new Date(timestamp).getTime() });
+  renderHeartbeatRow();
+}
+
+function renderHeartbeatRow() {
+  const now = Date.now();
+  pruneHeartbeatWindow(now);
+  const count = heartbeatWindow.length;
+  if (count === 0) {
+    if (heartbeatRowEl) { heartbeatRowEl.remove(); heartbeatRowEl = null; markEmptyIfNeeded(); }
+    return;
+  }
+  const sources = [...new Set(heartbeatWindow.map(h => h.source))].sort();
+  if (!heartbeatRowEl) {
+    heartbeatRowEl = document.createElement("div");
+    heartbeatRowEl.className = "row heartbeat-row";
+    heartbeatRowEl.dataset.kind = "sip_notify";
+    rowsSip.prepend(heartbeatRowEl);
+  }
+  const empty = rowsSip.querySelector(".empty");
+  if (empty) empty.remove();
+  heartbeatRowEl.style.display = activeKinds.has("sip_notify") ? "" : "none";
+  const windowSecs = Math.round(HEARTBEAT_WINDOW_MS / 1000);
+  heartbeatRowEl.innerHTML = `
+    <span class="time">${shortTime(new Date().toISOString())}</span>
+    <span class="badge" style="color:${KIND_META.sip_notify.color}"><span class="dot" style="background:${KIND_META.sip_notify.color}"></span>Heartbeat</span>
+    <span class="summary">${escapeHtml(sources.join(", "))} healthy · ×${count} in last ${windowSecs}s</span>
+  `;
 }
 
 function escapeHtml(s) {
@@ -488,6 +733,17 @@ function markEmptyIfNeeded() {
   }
 }
 
+// Single entry point for both the initial backlog render and live SSE
+// messages: sip_notify needs the heartbeat-collapsing detour, everything
+// else renders as a normal row.
+function handleEvent(event, prepend) {
+  if (event.kind === "sip_notify") {
+    handleSipNotify(event, prepend);
+  } else {
+    renderRow(event, prepend);
+  }
+}
+
 document.getElementById("btn-clear").addEventListener("click", async () => {
   await fetch("/api/clear", { method: "POST" });
   rowsLog.innerHTML = "";
@@ -496,14 +752,19 @@ document.getElementById("btn-clear").addEventListener("click", async () => {
   total = 0;
   statCount.textContent = total;
   statLast.textContent = "—";
+  for (const key of Object.keys(sipLastState)) delete sipLastState[key];
+  heartbeatWindow.length = 0;
+  heartbeatRowEl = null;
+  renderNodeChips();
   markEmptyIfNeeded();
 });
 
 buildFilters();
 loadNodes();
 setInterval(loadNodes, 10_000);
+setInterval(renderHeartbeatRow, 15_000); // prune the rolling window even when no new pings arrive
 const initialEvents = {{ events|tojson }};
-initialEvents.forEach(e => renderRow(e, false));
+initialEvents.forEach(e => handleEvent(e, false));
 markEmptyIfNeeded();
 
 const dot = document.getElementById("conn-dot");
@@ -514,7 +775,7 @@ sse.onerror = () => { dot.className = "conn-dot down"; label.textContent = "reco
 sse.onmessage = (e) => {
   const event = JSON.parse(e.data);
   document.querySelectorAll(`.empty`).forEach(el => el.remove());
-  renderRow(event, true);
+  handleEvent(event, true);
   total += 1;
   statCount.textContent = total;
   statLast.textContent = shortTime(event.timestamp);
