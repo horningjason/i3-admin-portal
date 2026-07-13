@@ -123,6 +123,9 @@
     border-radius: 999px;
     border: 1px solid var(--border);
     font-size: 12px;
+    text-transform: none;
+    letter-spacing: normal;
+    font-weight: normal;
     color: var(--text-secondary);
     cursor: pointer;
     user-select: none;
@@ -174,6 +177,10 @@
     overflow: hidden;
   }
   .panel h2 {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 10px;
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: .04em;
@@ -182,6 +189,14 @@
     margin: 0;
     background: var(--surface-1);
     border-bottom: 1px solid var(--gridline);
+  }
+  .panel h2 .panel-title {
+    white-space: nowrap;
+  }
+  .panel h2 .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
   }
   .rows {
     overflow-y: auto;
@@ -299,20 +314,19 @@
 
 <div class="nodes" id="nodes"></div>
 
-<div class="filters" id="filters"></div>
 <div class="filters secondary" id="filters-source"></div>
 
 <main>
   <div class="panel">
-    <h2>LogEvents (i3 §4.12.3)</h2>
+    <h2><span class="panel-title">LogEvents</span><div class="chips" id="chips-log"></div></h2>
     <div class="rows" id="rows-log"></div>
   </div>
   <div class="panel">
-    <h2>SIP State Notifications (§2.4)</h2>
+    <h2><span class="panel-title">SIP State Notifications</span><div class="chips" id="chips-sip"></div></h2>
     <div class="rows" id="rows-sip"></div>
   </div>
   <div class="panel dr">
-    <h2>Discrepancy Reports Received (i3 §3.7)</h2>
+    <h2><span class="panel-title">Discrepancy Reports Received</span><div class="chips" id="chips-dr"></div></h2>
     <div class="rows" id="rows-dr"></div>
   </div>
 </main>
@@ -336,7 +350,9 @@ const knownSources = new Set();
 const rowsLog = document.getElementById("rows-log");
 const rowsSip = document.getElementById("rows-sip");
 const rowsDr = document.getElementById("rows-dr");
-const filtersEl = document.getElementById("filters");
+const chipsLogEl = document.getElementById("chips-log");
+const chipsSipEl = document.getElementById("chips-sip");
+const chipsDrEl = document.getElementById("chips-dr");
 const filtersSourceEl = document.getElementById("filters-source");
 const nodesEl = document.getElementById("nodes");
 const statCount = document.getElementById("stat-count");
@@ -355,7 +371,8 @@ function buildFilters() {
       else { activeKinds.add(kind); chip.classList.remove("off"); }
       applyFilter();
     });
-    filtersEl.appendChild(chip);
+    const container = meta.panel === "sip" ? chipsSipEl : meta.panel === "dr" ? chipsDrEl : chipsLogEl;
+    container.appendChild(chip);
   }
 }
 
