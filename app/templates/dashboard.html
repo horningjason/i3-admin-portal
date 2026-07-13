@@ -465,7 +465,11 @@ function deriveResponseSummary(event) {
   const valid = detail.valid === true || detail.isValid === true
     || /^valid$/i.test(String(detail.responseType || ""))
     || /^valid$/i.test(String(detail.status || ""));
-  return deriveQueryLikeSummary(event, valid ? "valid" : "response");
+  // event.operation (the LoST response's actual root element, e.g.
+  // "findServiceResponse") is server-derived real data — prefer it over
+  // the "valid"/"response" heuristic, which is only a fallback guess.
+  const label = event.operation || (valid ? "valid" : "response");
+  return deriveQueryLikeSummary(event, label);
 }
 
 function deriveLogStateSummary(event) {
@@ -489,7 +493,7 @@ function deriveSubscribeSummary(event) {
 
 function computeSummary(event) {
   switch (event.kind) {
-    case "log_query":    return deriveQueryLikeSummary(event, "address query");
+    case "log_query":    return deriveQueryLikeSummary(event, event.operation || "address query");
     case "log_response": return deriveResponseSummary(event);
     case "log_state":    return deriveLogStateSummary(event);
     case "sip_notify":   return deriveNotifySummary(event);

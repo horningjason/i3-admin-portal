@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
@@ -105,10 +106,28 @@ _DR_RESPONDING_CONTACT_JCARD = [
 ]
 
 
-def _classify(body: dict) -> tuple[str, str, str, str]:
-    """Returns (kind, summary, source, role). Source/role come from matching
-    the LogEvent's elementId against nodes.json; unregistered senders still
-    show up, just tagged with their raw elementId/agencyId and role '?'."""
+def _xml_root_local_name(xml_str: str | None) -> str | None:
+    """Local (namespace-stripped) name of an XML string's root element, e.g.
+    "findService" out of "<ns0:findService xmlns:ns0="...">...". Used to
+    label LoST queryAdapter/responseAdapter blobs with their actual
+    operation. Defensive: any empty/None/unparseable input returns None
+    rather than raising — this only ever feeds a display label."""
+    if not xml_str:
+        return None
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    tag = root.tag
+    return tag.split("}", 1)[1] if tag.startswith("{") else tag
+
+
+def _classify(body: dict) -> tuple[str, str, str, str, str | None]:
+    """Returns (kind, summary, source, role, operation). Source/role come
+    from matching the LogEvent's elementId against nodes.json; unregistered
+    senders still show up, just tagged with their raw elementId/agencyId and
+    role '?'. operation is the LoST root element's local name (findService,
+    findServiceResponse, etc.) for LostQuery/LostResponseLogEvent, else None."""
     event_type = body.get("logEventType", "Unknown")
     direction = body.get("direction", "")
     kind = _LOG_EVENT_KIND.get(event_type, "log_other")
@@ -120,9 +139,12 @@ def _classify(body: dict) -> tuple[str, str, str, str]:
     else:
         source, role = element_id or body.get("agencyId") or "unknown", "?"
 
+    operation = None
     if event_type == "LostQueryLogEvent":
+        operation = _xml_root_local_name(body.get("queryAdapter"))
         summary = f"{direction} query {body.get('queryId', '')}"
     elif event_type == "LostResponseLogEvent":
+        operation = _xml_root_local_name(body.get("responseAdapter"))
         summary = f"{direction} response {body.get('responseId', '')}"
     elif event_type == "ElementStateChangeLogEvent":
         summary = f"{direction} ElementState change"
@@ -136,7 +158,7 @@ def _classify(body: dict) -> tuple[str, str, str, str]:
         summary = f"{direction} Versions"
     else:
         summary = event_type
-    return kind, summary, source, role
+    return kind, summary, source, role, operation
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -188,7 +210,7 @@ async def events_stream():
 async def receive_log_event(request: Request):
     """Matches i3-fe-core LoggingClient's POST target: {uri}/LogEvents."""
     body = await request.json()
-    kind, summary, source, role = _classify(body)
+    kind, summary, source, role, operation = _classify(body)
     # A node POSTing a LogEvent is proof it's alive right now — feed that into
     # liveness so an actively-working node shows green immediately, without
     # waiting on the next OPTIONS ping.
@@ -198,7 +220,7 @@ async def receive_log_event(request: Request):
         package = _LOG_EVENT_TO_PACKAGE.get(body.get("logEventType"))
         if package:
             await sub.kick_initial_subscribe(package)
-    store.add(kind, summary, body, source=source, role=role)
+    store.add(kind, summary, body, source=source, role=role, operation=operation)
     return JSONResponse({"status": "accepted"}, status_code=201)
 
 

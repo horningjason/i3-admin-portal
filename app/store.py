@@ -23,6 +23,7 @@ class Event:
     detail: dict[str, Any] = field(default_factory=dict)
     source: str = "unknown"   # node name (from nodes.json) or raw elementId/agencyId
     role: str = "?"           # LVF|ECRF|MCS|GCS|MDS|... from nodes.json, "?" if unattributed
+    operation: str | None = None  # LoST root element local name (findService, etc.), LostQuery/ResponseLogEvent only
 
 
 class EventStore:
@@ -38,6 +39,7 @@ class EventStore:
         detail: dict[str, Any] | None = None,
         source: str = "unknown",
         role: str = "?",
+        operation: str | None = None,
     ) -> Event:
         event = Event(
             id=next(self._counter),
@@ -47,6 +49,7 @@ class EventStore:
             detail=detail or {},
             source=source,
             role=role,
+            operation=operation,
         )
         self._events.append(event)
         for queue in list(self._subscribers):
