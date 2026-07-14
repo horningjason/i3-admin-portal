@@ -632,14 +632,26 @@ const heartbeatWindow = []; // [{ source, ts }], ts = event time (ms)
 const HEARTBEAT_WINDOW_MS = 90_000;
 let heartbeatRowEl = null;
 
-function handleSipNotify(event, prepend) {
+// precomputedChanged: used only by the backlog replay path (see
+// classifySipNotifyChronologically) to supply a changed/heartbeat verdict
+// that was computed in true chronological order, since backlog replay
+// renders newest-first and recomputing changed-vs-heartbeat against
+// sipLastState in that order would give the wrong answer. Live SSE calls
+// this with just (event, prepend), so this behaves exactly as before for
+// live events.
+function handleSipNotify(event, prepend, precomputedChanged) {
   const detail = event.detail || {};
   const pkg = detail.package;
   const state = extractNotifyState(detail);
   const key = `${event.source}|${pkg}`;
-  const isFirst = !(key in sipLastState);
-  const changed = isFirst || sipLastState[key] !== state;
-  sipLastState[key] = state;
+  let changed;
+  if (precomputedChanged !== undefined) {
+    changed = precomputedChanged;
+  } else {
+    const isFirst = !(key in sipLastState);
+    changed = isFirst || sipLastState[key] !== state;
+    sipLastState[key] = state;
+  }
 
   if (changed) {
     renderRow(event, prepend);
@@ -649,9 +661,35 @@ function handleSipNotify(event, prepend) {
   }
 }
 
+// Walks backlog events oldest-to-newest (their natural store order) to
+// decide, per sip_notify event, whether it's a real state transition or a
+// heartbeat -- exactly what live processing would decide -- without
+// rendering anything. Also leaves sipLastState holding each key's true
+// most-recent state, so the first live event after page load compares
+// correctly. Returns event.id -> changed, consumed by handleSipNotify
+// during the (reversed) render pass.
+function classifySipNotifyChronologically(events) {
+  const changedById = new Map();
+  for (const event of events) {
+    if (event.kind !== "sip_notify") continue;
+    const detail = event.detail || {};
+    const key = `${event.source}|${detail.package}`;
+    const state = extractNotifyState(detail);
+    const isFirst = !(key in sipLastState);
+    const changed = isFirst || sipLastState[key] !== state;
+    sipLastState[key] = state;
+    changedById.set(event.id, changed);
+  }
+  return changedById;
+}
+
 function pruneHeartbeatWindow(now) {
+  // Filter (not front-shift) since entries aren't guaranteed ascending:
+  // backlog replay pushes them newest-first, live pushes append newest-last.
   const cutoff = now - HEARTBEAT_WINDOW_MS;
-  while (heartbeatWindow.length && heartbeatWindow[0].ts < cutoff) heartbeatWindow.shift();
+  for (let i = heartbeatWindow.length - 1; i >= 0; i--) {
+    if (heartbeatWindow[i].ts < cutoff) heartbeatWindow.splice(i, 1);
+  }
 }
 
 function recordHeartbeat(source, timestamp) {
@@ -785,7 +823,18 @@ loadNodes();
 setInterval(loadNodes, 10_000);
 setInterval(renderHeartbeatRow, 15_000); // prune the rolling window even when no new pings arrive
 const initialEvents = {{ events|tojson }};
-initialEvents.forEach(e => handleEvent(e, false));
+// events arrives oldest-first. Classify sip_notify changed-vs-heartbeat in
+// that true chronological order first (see classifySipNotifyChronologically),
+// then replay in reverse (still appended, prepend=false) so backlog rows
+// land newest-on-top, matching the live SSE prepend order.
+const backlogSipChanged = classifySipNotifyChronologically(initialEvents);
+initialEvents.slice().reverse().forEach(e => {
+  if (e.kind === "sip_notify") {
+    handleSipNotify(e, false, backlogSipChanged.get(e.id));
+  } else {
+    handleEvent(e, false);
+  }
+});
 markEmptyIfNeeded();
 
 const dot = document.getElementById("conn-dot");
